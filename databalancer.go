@@ -5,17 +5,18 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"log"
-	"os"
-	"sort"
-	"strings"
-
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/kcl/out"
 	"github.com/twmb/tlscfg"
+	"io"
+	"log"
+	"os"
+	"sort"
+	"strings"
+	"time"
 )
 
 /*
@@ -27,7 +28,8 @@ import (
 6. Find the largest partition on the node with the most data
 7. Check to see if this partition has a replica on the node with the least amount of data
 8. If not then move the replica to the node with less data
-9. If true then move to the next largest partition on the node with the most data //TBD
+9. If true then move to the next largest partition on the node with the most data
+10. Repeat till the diff of utilization between most and least is within 20%
 */
 
 var (
@@ -55,7 +57,15 @@ type partitionInfo struct {
 
 func main() {
 	flag.Parse()
-	fmt.Println("starting...")
+	fmt.Println("starting data balancer...")
+
+	logFile, err := os.OpenFile("databalacer.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
+	if err != nil {
+		die(err.Error())
+	}
+	mw := io.MultiWriter(os.Stdout, logFile)
+	log.SetOutput(mw)
+
 	if *controllerHost == "" {
 		die("must specify controller . Use 'rpk cluster metadata' command")
 	}
@@ -96,22 +106,92 @@ func main() {
 	}
 	adm = kadm.NewClient(cl)
 
+	for {
+		time.Sleep(5 * time.Second)
+
+		tps, errored := getTopicsAndPartitions(err, adm)
+		log.Println("Retrieving topics and partitions:", tps)
+		if errored {
+			die("unable to get topics", err)
+			return
+		}
+
+		partInfoMap, brokerSizeMap := getLogDirSizeForPartitions(tps, cl)
+
+		log.Println("Size of each brokers:", brokerSizeMap)
+		log.Println("Partition/Broker Info:", partInfoMap)
+
+		leastDataSizeBroker, mostDataSizeBroker, brokerIds := findLessAndMostSizeBrokers(brokerSizeMap)
+		log.Println("Broker info from least to most in size:", brokerIds)
+		mostDataSizeBrokerUtilization := brokerSizeMap[mostDataSizeBroker]
+		leastDataSizeBrokerUtilization := brokerSizeMap[leastDataSizeBroker]
+		// % Decrease = Most - Least / Least Size × 100
+		diffUtilization := ((mostDataSizeBrokerUtilization - leastDataSizeBrokerUtilization) / leastDataSizeBrokerUtilization) * 100
+		log.Println("Percent diff of disk utilization between most and least size broker:", diffUtilization)
+		if diffUtilization < 20 { // if diff of Utilization less that 20 percent don't move partitions
+			//sleep for 5min
+			log.Println("Pausing movement for 5min")
+			time.Sleep(5 * time.Minute)
+			continue
+		}
+
+		largPart := findLargestPartitionInBroker(partInfoMap, mostDataSizeBroker)
+		log.Println("Large partition to be moved:", largPart)
+		// move from least to most size brokers
+		for idx := 0; idx < len(brokerIds)-1; idx++ { //ignore existing most size node since its sorted
+
+			isOn, _ := isPartitionOnBroker(partInfoMap, brokerIds[idx], largPart)
+			log.Println("Is replica:", largPart, " on broker:", brokerIds[idx], isOn)
+			isSpaceAvailable, err := isEnoughSpaceAvailable(*controllerHost, brokerIds[idx], largPart.size)
+			log.Println("Is free space available on broker: ", brokerIds[idx], isSpaceAvailable)
+			if err != nil {
+				die("Unable to find if space is available on broker id to move larger replica", brokerIds[idx], err)
+			}
+			//see if its in the less loaded broker
+			if isOn != true && isSpaceAvailable {
+				log.Println("Moving replica.. ", largPart, "broker:", brokerIds[idx])
+				movePart, err := moveReplica(mostDataSizeBroker, brokerIds[idx], largPart, *controllerHost)
+				log.Println("Replica movement initiated.. ", movePart, "broker:", brokerIds[idx])
+				if err != nil {
+					die("Error while moving replica:", largPart, "broker:", brokerIds[idx], err)
+				}
+				flag := true
+				for flag {
+					err, partDetail := getPartitionDetail(*controllerHost, largPart)
+					log.Println("Partition movement in progress.Replica Status:", partDetail)
+					if err != nil {
+						die("Error retrieving partition status while moving replica:", largPart, "broker:", brokerIds[idx], err)
+					}
+					if partDetail.Status == "in_progress" {
+						log.Println("Partition movement in progress.. ", largPart, "to broker:", brokerIds[idx])
+						time.Sleep(1 * time.Minute)
+						continue
+					} else if partDetail.Status == "done" {
+						flag = false
+						log.Println("Replica movement done.. ", largPart, "moved to broker:", brokerIds[idx])
+						break
+					}
+					log.Println("Unknown status during Replica movement .. ", largPart, "moved to broker:", brokerIds[idx], "status:", partDetail.Status)
+				}
+				break
+			}
+
+		}
+	}
+}
+
+func getTopicsAndPartitions(err error, adm *kadm.Client) (map[string][]int32, bool) {
 	topicList, err := adm.ListTopics(context.Background()) //returns internal topics as well. filter it below
 	if err != nil {
-		fmt.Println("unable to list topics: %w", err)
-		return
+		log.Println("unable to list topics: %w", err)
+		return nil, true
 	}
 
-	/*var m kadm.Metadata
-	m, err = adm.MetadataWithoutTopics(context.Background())
-	out.MaybeDie(err, "unable to request metadata: %v", err)
-	controllerHost := getControllerHost(m.Controller, m.Brokers)
-	*/
 	log.Println("Controller Host is:" + *controllerHost)
 
 	metaReq := kmsg.NewMetadataRequest()
 	var tps = make(map[string][]int32)
-	var req kmsg.DescribeLogDirsRequest
+
 	for indexT, _ := range topicList {
 		t := topicList[indexT]
 		if t.Err != nil {
@@ -132,7 +212,11 @@ func main() {
 			tps[indexT] = append(tps[indexT], part.Partition)
 		}
 	}
+	return tps, false
+}
 
+func getLogDirSizeForPartitions(tps map[string][]int32, cl *kgo.Client) (map[int32][]partitionInfo, map[int32]int64) {
+	var req kmsg.DescribeLogDirsRequest
 	for topic, partitions := range tps {
 		req.Topics = append(req.Topics, kmsg.DescribeLogDirsRequestTopic{
 			Topic:      topic,
@@ -182,31 +266,12 @@ func main() {
 			}
 		}
 	}
+
 	_ = tw.Flush()
-
-	log.Println("Size of each brokers:", brokerSizeMap)
-	log.Println("Partition/Broker Info:", partInfoMap)
-
-	leastDataSizeBroker, mostDataSizeBroker := findLessAndMostSizeBrokers(brokerSizeMap)
-
-	fmt.Println("Broker with less data:", leastDataSizeBroker)
-	fmt.Println("Broker with most data:", mostDataSizeBroker)
-	largPart := findLargestPartitionInBroker(partInfoMap, mostDataSizeBroker)
-
-	isSpaceAvaiable, err := isEnoughSpaceAvailable(*controllerHost, int(leastDataSizeBroker), largPart.size)
-	if err != nil {
-		die("Unable to find if space is avaiable on broker id to move larger replica", leastDataSizeBroker, err)
-	}
-	if isSpaceAvaiable {
-		fmt.Println("Moving replica.. ", largPart, "broker:", leastDataSizeBroker)
-		err := moveReplica(leastDataSizeBroker, largPart, *controllerHost)
-		if err != nil {
-			die("Error while moving replica:", largPart, "broker:", leastDataSizeBroker, err)
-		}
-	}
+	return partInfoMap, brokerSizeMap
 }
 
-func findLessAndMostSizeBrokers(brokerSizeMap map[int32]int64) (lessSize int32, moreSize int32) {
+func findLessAndMostSizeBrokers(brokerSizeMap map[int32]int64) (lessSize int32, moreSize int32, ids []int32) {
 	brokerIds := make([]int32, 0, len(brokerSizeMap))
 	for brokerid := range brokerSizeMap {
 		brokerIds = append(brokerIds, brokerid)
@@ -216,7 +281,7 @@ func findLessAndMostSizeBrokers(brokerSizeMap map[int32]int64) (lessSize int32, 
 	})
 	lessDataSizeBroker := brokerIds[0]
 	mostDataSizeBroker := brokerIds[len(brokerIds)-1]
-	return lessDataSizeBroker, mostDataSizeBroker
+	return lessDataSizeBroker, mostDataSizeBroker, brokerIds
 }
 
 func findLargestPartitionInBroker(pmap map[int32][]partitionInfo, brokerId int32) partitionInfo {
@@ -228,4 +293,20 @@ func findLargestPartitionInBroker(pmap map[int32][]partitionInfo, brokerId int32
 		return v[0]
 	}
 	return partitionInfo{}
+}
+
+func isPartitionOnBroker(pmap map[int32][]partitionInfo, broker_id int32, part partitionInfo) (b bool, topic string) {
+	for k, v := range pmap {
+		if k == broker_id {
+			p_info := v
+			for i := 0; i < len(p_info); i++ {
+				if p_info[i].partition == part.partition && p_info[i].topicName == part.topicName {
+					log.Println("found partition on ", i, " part:", p_info[i].partition, "topic:", p_info[i].topicName)
+					return true, p_info[i].topicName
+				}
+				continue
+			}
+		}
+	}
+	return false, ""
 }

@@ -69,42 +69,51 @@ func getJson(url string, target interface{}) error {
 	return err
 }
 
-func moveReplica(broker_id int32, partInfo partitionInfo, host string) error {
+func moveReplica(fromBrokerID int32, toBrokerID int32, partInfo partitionInfo, host string) (partitionDetail, error) {
 
+	err, pdetail := getPartitionDetail(host, partInfo)
+	if err != nil {
+		return pdetail, err
+	}
+	// Stop if balancing is going on this topic
+	if pdetail.Status != "done" {
+		return pdetail, nil
+	}
+
+	max_core, err := findMaxCore(host)
+	if err != nil {
+		return pdetail, nil
+	}
+	core := rand.Intn(max_core) // pick a random core
+
+	replicas := pdetail.Replicas
+	for i := 0; i < len(replicas); i++ {
+		attr := &replicas[i]
+		if attr.NodeId == int(fromBrokerID) { // if current broker is fromBroker then change
+			attr.NodeId = int(toBrokerID)
+			attr.CoreId = core
+			break
+		}
+	}
+	pdetail.Replicas = replicas
+	postMoveReplica(host, partInfo, pdetail)
+	return pdetail, nil
+}
+
+func getPartitionDetail(host string, partInfo partitionInfo) (error, partitionDetail) {
 	partDetail := partitionDetail{}
 	param := []string{partInfo.topicName, strconv.FormatInt(int64(partInfo.partition), 10)}
 	url := buildUri(host, GET_PARTITION_DETAIL, param)
 	err := getJson(url, &partDetail)
 	if err != nil {
-		return err
+		return nil, partDetail
 	}
-	// Stop if balancing is going on this topic
-	if partDetail.Status != "done" {
-		return fmt.Errorf("partition in middle of transititon")
-	}
-
-	max_core, err := findMaxCore(host)
-	if err != nil {
-		return err
-	}
-	core := rand.Intn(max_core)
-
-	replicas := partDetail.Replicas
-	for i := 0; i < len(replicas); i++ {
-		attr := &replicas[i]
-		if attr.CoreId != partDetail.LeaderId {
-			attr.NodeId = int(broker_id)
-			attr.CoreId = core
-			break
-		}
-	}
-	partDetail.Replicas = replicas
-	url = buildUri(host, MOVE_REPLICA, param)
-	postMoveReplica(url, partDetail)
-	return nil
+	return err, partDetail
 }
 
-func postMoveReplica(url string, payload partitionDetail) {
+func postMoveReplica(host string, partInfo partitionInfo, payload partitionDetail) {
+	param := []string{partInfo.topicName, strconv.FormatInt(int64(partInfo.partition), 10)}
+	url := buildUri(host, MOVE_REPLICA, param)
 	p, _ := json.Marshal(payload.Replicas)
 
 	request, err := http.NewRequest("POST", url, bytes.NewBuffer(p))
@@ -124,31 +133,37 @@ func postMoveReplica(url string, payload partitionDetail) {
 	fmt.Println("response Body:", string(body))
 }
 
-func isEnoughSpaceAvailable(host string, destinationBrokerID int, neededSpace int64) (flag bool, e error) {
+func getAvailableSpace(host string, destinationBrokerID int32) (free int64, e error) {
 	brokInfos := brokerInfos{}
 	param := []string{}
 	url := buildUri(host, GET_BROKERS, param)
 	err := getJson(url, &brokInfos)
 	if err != nil {
-		return false, err
+		return -1, err
 	}
 	if len(brokInfos) == 0 {
-		return false, errors.New("Cannot find broker info")
+		return -1, errors.New("Cannot find broker info")
 	}
 	for _, v := range brokInfos {
-		if v.NodeId == destinationBrokerID {
+		if int32(v.NodeId) == destinationBrokerID {
 			space := v.DiskSpace
 			free := space[0].Free
-			fmt.Println("free space on broker id:", v.NodeId, free)
-			fmt.Println("needed space on broker id:", v.NodeId, neededSpace)
-			if free > neededSpace {
-
-				return true, nil
-			}
+			return free, nil
 		}
 	}
-	return false, errors.New("Cannot find broker with available space")
+	return -1, errors.New("Cannot find broker with available space")
 
+}
+
+func isEnoughSpaceAvailable(host string, destinationBrokerID int32, neededSpace int64) (flag bool, e error) {
+	free, err := getAvailableSpace(host, destinationBrokerID)
+	if err != nil {
+		return false, err
+	}
+	if free > neededSpace {
+		return true, nil
+	}
+	return false, nil
 }
 
 func findMaxCore(host string) (maxC int, e error) {

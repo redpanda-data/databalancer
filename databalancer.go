@@ -33,15 +33,14 @@ import (
 */
 
 var (
-	seedBrokers    = flag.String("brokers", "", "comma delimited list of seed brokers")
-	controllerHost = flag.String("controller-host", "", "Current controller broker")
-	saslMethod     = flag.String("sasl-method", "", "if non-empty, sasl method to use (must specify all options; supports plain, scram-sha-256, scram-sha-512, aws_msk_iam)")
-	saslUser       = flag.String("sasl-user", "", "if non-empty, username to use for sasl (must specify all options)")
-	saslPass       = flag.String("sasl-pass", "", "if non-empty, password to use for sasl (must specify all options)")
-	dialTLS        = flag.Bool("tls", false, "if true, use tls for connecting (if using well-known TLS certs)")
-	caFile         = flag.String("ca-cert", "", "if non-empty, path to CA cert to use for TLS (implies -tls)")
-	certFile       = flag.String("client-cert", "", "if non-empty, path to client cert to use for TLS (requires -client-key, implies -tls)")
-	keyFile        = flag.String("client-key", "", "if non-empty, path to client key to use for TLS (requires -client-cert, implies -tls)")
+	seedBrokers = flag.String("brokers", "", "comma delimited list of seed brokers")
+	saslMethod  = flag.String("sasl-method", "", "if non-empty, sasl method to use (must specify all options; supports plain, scram-sha-256, scram-sha-512, aws_msk_iam)")
+	saslUser    = flag.String("sasl-user", "", "if non-empty, username to use for sasl (must specify all options)")
+	saslPass    = flag.String("sasl-pass", "", "if non-empty, password to use for sasl (must specify all options)")
+	dialTLS     = flag.Bool("tls", false, "if true, use tls for connecting (if using well-known TLS certs)")
+	caFile      = flag.String("ca-cert", "", "if non-empty, path to CA cert to use for TLS (implies -tls)")
+	certFile    = flag.String("client-cert", "", "if non-empty, path to client cert to use for TLS (requires -client-key, implies -tls)")
+	keyFile     = flag.String("client-key", "", "if non-empty, path to client key to use for TLS (requires -client-cert, implies -tls)")
 )
 
 func die(msg string, args ...interface{}) {
@@ -66,9 +65,6 @@ func main() {
 	mw := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(mw)
 
-	if *controllerHost == "" {
-		die("must specify controller . Use 'rpk cluster metadata' command")
-	}
 	var customTLS bool
 	if *caFile != "" || *certFile != "" || *keyFile != "" {
 		*dialTLS = true
@@ -99,6 +95,7 @@ func main() {
 	}.AsSha256Mechanism()))*/
 
 	var adm *kadm.Client
+	var m kadm.Metadata
 
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {
@@ -137,12 +134,13 @@ func main() {
 
 		largPart := findLargestPartitionInBroker(partInfoMap, mostDataSizeBroker)
 		log.Println("Large partition to be moved:", largPart)
-		// move from least to most size brokers
+		// iterate from least to most size brokers
 		for idx := 0; idx < len(brokerIds)-1; idx++ { //ignore existing most size node since its sorted
-
+			err, controllerHost := discoverController(m, err, adm)
+			log.Println("Controller host: ", controllerHost)
 			isOn, _ := isPartitionOnBroker(partInfoMap, brokerIds[idx], largPart)
 			log.Println("Is replica:", largPart, " on broker:", brokerIds[idx], isOn)
-			isSpaceAvailable, err := isEnoughSpaceAvailable(*controllerHost, brokerIds[idx], largPart.size)
+			isSpaceAvailable, err := isEnoughSpaceAvailable(controllerHost, brokerIds[idx], largPart.size)
 			log.Println("Is free space available on broker: ", brokerIds[idx], isSpaceAvailable)
 			if err != nil {
 				die("Unable to find if space is available on broker id to move larger replica", brokerIds[idx], err)
@@ -150,14 +148,14 @@ func main() {
 			//see if its in the less loaded broker
 			if isOn != true && isSpaceAvailable {
 				log.Println("Moving replica.. ", largPart, "broker:", brokerIds[idx])
-				movePart, err := moveReplica(mostDataSizeBroker, brokerIds[idx], largPart, *controllerHost)
+				movePart, err := moveReplica(mostDataSizeBroker, brokerIds[idx], largPart, controllerHost)
 				log.Println("Replica movement initiated.. ", movePart, "broker:", brokerIds[idx])
 				if err != nil {
 					die("Error while moving replica:", largPart, "broker:", brokerIds[idx], err)
 				}
 				flag := true
 				for flag {
-					err, partDetail := getPartitionDetail(*controllerHost, largPart)
+					err, partDetail := getPartitionDetail(controllerHost, largPart)
 					log.Println("Partition movement in progress.Replica Status:", partDetail)
 					if err != nil {
 						die("Error retrieving partition status while moving replica:", largPart, "broker:", brokerIds[idx], err)
@@ -186,8 +184,6 @@ func getTopicsAndPartitions(err error, adm *kadm.Client) (map[string][]int32, bo
 		log.Println("unable to list topics: %w", err)
 		return nil, true
 	}
-
-	log.Println("Controller Host is:" + *controllerHost)
 
 	metaReq := kmsg.NewMetadataRequest()
 	var tps = make(map[string][]int32)
@@ -309,4 +305,21 @@ func isPartitionOnBroker(pmap map[int32][]partitionInfo, broker_id int32, part p
 		}
 	}
 	return false, ""
+}
+
+func discoverController(m kadm.Metadata, err error, adm *kadm.Client) (error, string) {
+	m, err = adm.MetadataWithoutTopics(context.Background())
+	out.MaybeDie(err, "Unable to request metadata: %v", err)
+	controllerHost := getControllerHost(m.Controller, m.Brokers)
+	return err, controllerHost
+}
+
+func getControllerHost(controllerID int32, brokers kadm.BrokerDetails) string {
+	for i := range brokers {
+		if brokers[i].NodeID == controllerID {
+			return brokers[i].Host
+			break
+		}
+	}
+	return ""
 }

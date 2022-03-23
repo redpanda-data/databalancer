@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -30,19 +31,6 @@ type partitionDetail struct {
 type replicaInfo struct {
 	NodeId int `json:"node_id"`
 	CoreId int `json:"core"`
-}
-
-type controllerInfo struct {
-	Ns          string `json:"ns"`
-	Topic       string `json:"topic"`
-	PartitionId int    `json:"partition_id"`
-	Status      string `json:"status"`
-	LeaderId    int    `json:"leader_id"`
-	RaftGroupId int    `json:"raft_group_id"`
-	Replicas    []struct {
-		NodeId int `json:"node_id"`
-		Core   int `json:"core"`
-	} `json:"replicas"`
 }
 
 type brokerInfo struct {
@@ -118,7 +106,7 @@ func postMoveReplica(host string, partInfo partitionInfo, payload partitionDetai
 
 	request, err := http.NewRequest("POST", url, bytes.NewBuffer(p))
 	request.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	fmt.Println("Request:", request)
+	log.Println("Request:", request)
 
 	client := &http.Client{}
 	response, err := client.Do(request)
@@ -151,7 +139,7 @@ func getAvailableSpace(host string, destinationBrokerID int32) (free int64, e er
 			return free, nil
 		}
 	}
-	return -1, errors.New("Cannot find broker with available space")
+	return -1, errors.New("Cannot find broker info")
 
 }
 
@@ -177,7 +165,7 @@ func findMaxCore(host string) (maxC int, e error) {
 	}
 
 	if len(brokInfos) == 0 {
-		return 0, errors.New("Cannot find avaiable cores of a broker")
+		return 0, errors.New("Cannot find available cores of a broker")
 	}
 	max := 0
 	for _, v := range brokInfos {
@@ -186,34 +174,6 @@ func findMaxCore(host string) (maxC int, e error) {
 		}
 	}
 	return max, nil
-}
-
-func findController(host string) (int, error) {
-	brokInfos := brokerInfos{}
-	param := []string{}
-	url := buildUri(host, GET_BROKERS, param)
-	err := getJson(url, &brokInfos)
-	if err != nil {
-		return 0, err
-	}
-	controllerInfo := controllerInfo{}
-	param = []string{}
-	url = buildUri(host, GET_CONTROLLER, param)
-	err = getJson(url, &controllerInfo)
-	if err != nil {
-		return 0, err
-	}
-
-	if len(brokInfos) == 0 {
-		return 0, errors.New("Cannot get broker info")
-	}
-	leaderID := -1
-	for _, v := range brokInfos {
-		if v.NodeId == controllerInfo.LeaderId {
-			leaderID = controllerInfo.LeaderId
-		}
-	}
-	return leaderID, nil
 }
 
 func buildUri(host string, action int, param []string) string {

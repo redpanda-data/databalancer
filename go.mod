@@ -13,6 +13,7 @@ require (
 require (
 	github.com/klauspost/compress v1.14.4 // indirect
 	github.com/pierrec/lz4/v4 v4.1.14 // indirect
+	github.com/sirupsen/logrus v1.8.1 // indirect
 	github.com/twmb/go-rbtree v1.0.0 // indirect
-	golang.org/x/crypto v0.0.0-20220214200702-86341886e292 // indirect
+	golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
 )

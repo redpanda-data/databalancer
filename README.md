@@ -7,3 +7,5 @@ or
 
 go run admin.go databalancer.go --brokers \<seed brokers> 
 
+
+NOTE: Disable automatic rebalancing if you plan to use this script.

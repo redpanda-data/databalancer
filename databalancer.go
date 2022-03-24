@@ -5,18 +5,20 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/kcl/out"
 	"github.com/twmb/tlscfg"
-	"io"
-	"log"
-	"os"
-	"sort"
-	"strings"
-	"time"
 )
 
 /*
@@ -43,24 +45,23 @@ var (
 	keyFile     = flag.String("client-key", "", "if non-empty, path to client key to use for TLS (requires -client-cert, implies -tls)")
 )
 
-func die(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg, args...)
-	os.Exit(1)
-}
-
 type partitionInfo struct {
 	topicName string
 	partition int32
 	size      int64
 }
 
+func retry_backoff() {
+	time.Sleep(10 * time.Second)
+}
+
 func main() {
 	flag.Parse()
-	fmt.Println("starting data balancer...")
+	log.Println("starting data balancer...")
 
-	logFile, err := os.OpenFile("databalacer.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
+	logFile, err := os.OpenFile("databalacer.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
 	if err != nil {
-		die(err.Error())
+		log.Fatalf("unable to open databalacer.log file, error: %v", err.Error())
 	}
 	mw := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(mw)
@@ -81,7 +82,7 @@ func main() {
 				tlscfg.MaybeWithDiskKeyPair(*certFile, *keyFile),
 			)
 			if err != nil {
-				die("unable to create tls config: %v", err)
+				log.Fatalf("unable to create tls config: %v", err)
 			}
 			opts = append(opts, kgo.DialTLSConfig(tc))
 		} else {
@@ -89,87 +90,90 @@ func main() {
 		}
 	}
 
-	/*	opts = append(opts, kgo.SASL(scram.Auth{
-		User: *saslUser,
-		Pass: *saslPass,
-	}.AsSha256Mechanism()))*/
-
-	var adm *kadm.Client
-	var m kadm.Metadata
-
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {
-		die("unable to create admin client: %v", err)
+		log.Fatalf("unable to create client: %v", err)
 	}
-	adm = kadm.NewClient(cl)
+	adm := kadm.NewClient(cl)
 
 	for {
-		time.Sleep(5 * time.Second)
 
-		tps, errored := getTopicsAndPartitions(err, adm)
-		log.Println("Retrieving topics and partitions:", tps)
-		if errored {
-			die("unable to get topics", err)
-			return
+		tps, err := getTopicsAndPartitions(adm)
+		if err != nil {
+			log.Errorf("unable to get topic list, error: %v, waiting 10 seconds before next retry", err)
+			retry_backoff()
+			continue
 		}
+		log.Infof("Topic partitions list: %v", tps)
 
 		partInfoMap, brokerSizeMap := getLogDirSizeForPartitions(tps, cl)
-
-		log.Println("Size of each brokers:", brokerSizeMap)
-		log.Println("Partition/Broker Info:", partInfoMap)
+		if len(brokerSizeMap) == 1 {
+			log.Info("Single node cluster, nothing to move")
+			os.Exit(1)
+		}
+		log.Infof("Size of each broker: %v", brokerSizeMap)
+		log.Infof("Partition/Broker Info: %v", partInfoMap)
 
 		leastDataSizeBroker, mostDataSizeBroker, brokerIds := findLessAndMostSizeBrokers(brokerSizeMap)
-		log.Println("Broker info from least to most in size:", brokerIds)
+		log.Infof("Broker ids from least to most in size: %v", brokerIds)
 		mostDataSizeBrokerUtilization := brokerSizeMap[mostDataSizeBroker]
 		leastDataSizeBrokerUtilization := brokerSizeMap[leastDataSizeBroker]
 		// % Decrease = Most - Least / Least Size × 100
 		diffUtilization := ((mostDataSizeBrokerUtilization - leastDataSizeBrokerUtilization) / leastDataSizeBrokerUtilization) * 100
-		log.Println("Percent diff of disk utilization between most and least size broker:", diffUtilization)
+		log.Infof("Percent diff of disk utilization between most and least size broker: %v", diffUtilization)
 		if diffUtilization < 20 { // if diff of Utilization less that 20 percent don't move partitions
 			//sleep for 5min
-			log.Println("Pausing movement for 5min")
+			log.Info("Pausing movement for 5min")
 			time.Sleep(5 * time.Minute)
 			continue
 		}
 
-		largPart := findLargestPartitionInBroker(partInfoMap, mostDataSizeBroker)
-		log.Println("Large partition to be moved:", largPart)
+		largePartition := findLargestPartitionInBroker(partInfoMap, mostDataSizeBroker)
+		log.Infof("Large partition to be moved: %v", largePartition)
 		// iterate from least to most size brokers
-		for idx := 0; idx < len(brokerIds)-1; idx++ { //ignore existing most size node since its sorted
-			err, controllerHost := discoverController(m, err, adm)
-			log.Println("Controller host: ", controllerHost)
-			isOn, _ := isPartitionOnBroker(partInfoMap, brokerIds[idx], largPart)
-			log.Println("Is replica:", largPart, " on broker:", brokerIds[idx], isOn)
-			isSpaceAvailable, err := isEnoughSpaceAvailable(controllerHost, brokerIds[idx], largPart.size)
-			log.Println("Is free space available on broker: ", brokerIds[idx], isSpaceAvailable)
+		for _, brokerId := range brokerIds[:len(brokerIds)-1] { //ignore existing most size node since its sorted
+			controllerHost, err := discoverController(adm)
 			if err != nil {
-				die("Unable to find if space is available on broker id to move larger replica", brokerIds[idx], err)
+				log.Errorf("Unable to find controller, will retry in 10 seconds, error: %v", err)
+			}
+			log.Infof("Controller host: %v", controllerHost)
+			isOn, _ := isPartitionOnBroker(partInfoMap, brokerId, largePartition)
+			log.Infof("Is replica: %v on broker: %v - %v", largePartition, brokerId, isOn)
+			isSpaceAvailable, err := isEnoughSpaceAvailable(controllerHost, brokerId, largePartition.size)
+			log.Infof("Is free space available on broker: %v - %v", brokerId, isSpaceAvailable)
+			if err != nil {
+				log.Errorf("Unable to find if space is available on broker id to move larger replica", brokerId, err)
+				retry_backoff()
+				break
 			}
 			//see if its in the less loaded broker
-			if isOn != true && isSpaceAvailable {
-				log.Println("Moving replica.. ", largPart, "broker:", brokerIds[idx])
-				movePart, err := moveReplica(mostDataSizeBroker, brokerIds[idx], largPart, controllerHost)
-				log.Println("Replica movement initiated.. ", movePart, "broker:", brokerIds[idx])
+			if !isOn && isSpaceAvailable {
+				log.Infof("Moving partition replica %v to broker %v", largePartition, brokerId)
+				movePart, err := moveReplica(mostDataSizeBroker, brokerId, largePartition, controllerHost)
+				log.Infof("Partition %v replica movement initiated to %v ", movePart, brokerId)
 				if err != nil {
-					die("Error while moving replica:", largPart, "broker:", brokerIds[idx], err)
+					log.Errorf("Error while moving replica %v to broker %v - %v", largePartition, brokerId, err)
+					retry_backoff()
+					break
 				}
-				flag := true
-				for flag {
-					err, partDetail := getPartitionDetail(controllerHost, largPart)
-					log.Println("Partition movement in progress.Replica Status:", partDetail)
+				err, partDetail := getPartitionDetail(controllerHost, largePartition)
+
+				for err != nil || partDetail.Status != "done" {
+					err, partDetail = getPartitionDetail(controllerHost, largePartition)
 					if err != nil {
-						die("Error retrieving partition status while moving replica:", largPart, "broker:", brokerIds[idx], err)
+						log.Errorf("Unable to retrieve partition %v details, error: %v", largePartition, err)
+						retry_backoff()
 					}
+					log.Infof("Replica status: %v", partDetail)
+
 					if partDetail.Status == "in_progress" {
-						log.Println("Partition movement in progress.. ", largPart, "to broker:", brokerIds[idx])
+						log.Infof("Waiting for partition %v move to broker %v", largePartition, brokerId)
 						time.Sleep(1 * time.Minute)
 						continue
 					} else if partDetail.Status == "done" {
-						flag = false
-						log.Println("Replica movement done.. ", largPart, "moved to broker:", brokerIds[idx])
+						log.Infof("Partition %v move to broker %v finished", largePartition, brokerId)
 						break
 					}
-					log.Println("Unknown status during Replica movement .. ", largPart, "moved to broker:", brokerIds[idx], "status:", partDetail.Status)
 				}
 				break
 			}
@@ -178,37 +182,29 @@ func main() {
 	}
 }
 
-func getTopicsAndPartitions(err error, adm *kadm.Client) (map[string][]int32, bool) {
+func getTopicsAndPartitions(adm *kadm.Client) (map[string][]int32, error) {
 	topicList, err := adm.ListTopics(context.Background()) //returns internal topics as well. filter it below
 	if err != nil {
-		log.Println("unable to list topics: %w", err)
-		return nil, true
+		return nil, err
 	}
 
-	metaReq := kmsg.NewMetadataRequest()
 	var tps = make(map[string][]int32)
 
-	for indexT, _ := range topicList {
-		t := topicList[indexT]
-		if t.Err != nil {
-			die("unable to describe topics, topic err: %w", t.Err)
+	for _, topic := range topicList {
+
+		if topic.Err != nil {
+			log.Fatalf("unable to describe topics, topic err: %w", topic.Err)
 		}
-		//ignore RP internal topcs
-		if strings.Contains(indexT, "__redpanda") {
+		//ignore RP internal topics
+		if strings.Contains(topic.Topic, "__redpanda") || strings.Contains(topic.Topic, "__consumer_offsets") {
 			continue
 		}
 
-		metaReqTopic := kmsg.NewMetadataRequestTopic()
-		metaReqTopic.Topic = &t.Topic
-		metaReq.Topics = append(metaReq.Topics, metaReqTopic)
-		if len(metaReq.Topics) == 0 {
-			die("unable to request metadata: %v", err)
-		}
-		for _, part := range t.Partitions {
-			tps[indexT] = append(tps[indexT], part.Partition)
+		for _, part := range topic.Partitions {
+			tps[topic.Topic] = append(tps[topic.Topic], part.Partition)
 		}
 	}
-	return tps, false
+	return tps, nil
 }
 
 func getLogDirSizeForPartitions(tps map[string][]int32, cl *kgo.Client) (map[int32][]partitionInfo, map[int32]int64) {
@@ -297,7 +293,7 @@ func isPartitionOnBroker(pmap map[int32][]partitionInfo, broker_id int32, part p
 			p_info := v
 			for i := 0; i < len(p_info); i++ {
 				if p_info[i].partition == part.partition && p_info[i].topicName == part.topicName {
-					log.Println("found partition on ", i, " part:", p_info[i].partition, "topic:", p_info[i].topicName)
+					log.Infof("found partition on %d - partition: %v, topic: %v", i, p_info[i].topicName, p_info[i].partition)
 					return true, p_info[i].topicName
 				}
 				continue
@@ -307,11 +303,14 @@ func isPartitionOnBroker(pmap map[int32][]partitionInfo, broker_id int32, part p
 	return false, ""
 }
 
-func discoverController(m kadm.Metadata, err error, adm *kadm.Client) (error, string) {
-	m, err = adm.MetadataWithoutTopics(context.Background())
-	out.MaybeDie(err, "Unable to request metadata: %v", err)
+func discoverController(adm *kadm.Client) (string, error) {
+	m, err := adm.MetadataWithoutTopics(context.Background())
+	if err != nil {
+		log.Errorf("Unable to request metadata: %v", err)
+		return "", err
+	}
 	controllerHost := getControllerHost(m.Controller, m.Brokers)
-	return err, controllerHost
+	return controllerHost, nil
 }
 
 func getControllerHost(controllerID int32, brokers kadm.BrokerDetails) string {
